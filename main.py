@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("koyeb")
 
-POLL_INTERVAL_SEC = 30 * 60  # 30 menit
+POLL_INTERVAL_SEC = 1 * 60  # 1 menit
 GDRIVE_ROOT       = "mesin_cuan"
 QUEUE_FOLDER      = "queue"
 DONE_FOLDER       = "done"
