@@ -2,6 +2,17 @@
 koyeb_app/main.py - YouTube Upload Scheduler
 Polling GDrive setiap 1 menit, upload ke YouTube kalau sudah waktunya.
 HTTP server di port 8080 untuk keep-alive ping dari Uptime.com
+
+Notifikasi Telegram — hanya event penting (tidak spam):
+  🚀 Bot start
+  📥 Mulai download & upload
+  ✅ Upload berhasil
+  ❌ Upload gagal
+  ⚠️  Error channel (token expired, dll)
+
+Setup (set env vars di Koyeb):
+  TELEGRAM_BOT_TOKEN  → token dari @BotFather
+  TELEGRAM_CHAT_ID    → dari api.telegram.org/bot<TOKEN>/getUpdates
 """
 
 import os
@@ -12,6 +23,8 @@ import base64
 import tempfile
 import logging
 import threading
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -34,8 +47,45 @@ CHANNELS = [
     {"id": "ch_en_psych",  "env_key": "TOKEN_CH_EN_PSYCH",  "language": "en"},
 ]
 
-# Status untuk health check
 _status = {"last_poll": None, "uploads_today": 0, "running": True}
+
+
+# ─── Telegram Notifikasi ──────────────────────────────────────────────────────
+# Hanya dipanggil untuk event PENTING. Polling & skip tidak di-notif.
+
+def _send_telegram(message: str):
+    """
+    Kirim pesan ke Telegram via Bot API.
+    Gagal kirim hanya di-log, tidak mengganggu proses upload.
+
+    Env vars:
+      TELEGRAM_BOT_TOKEN  → dari @BotFather
+      TELEGRAM_CHAT_ID    → chat id tujuan
+    """
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        return  # Env belum di-set, skip tanpa error
+
+    try:
+        url     = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = json.dumps({
+            "chat_id":    chat_id,
+            "text":       message,
+            "parse_mode": "HTML"
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                logger.warning(f"Telegram response: {resp.status}")
+    except Exception as e:
+        # Gagal kirim notif tidak boleh crash uploader
+        logger.warning(f"Gagal kirim Telegram notif: {e}")
 
 
 # ─── HTTP Keep-alive server ───────────────────────────────────────────────────
@@ -46,8 +96,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         resp = json.dumps({
-            "status":       "running",
-            "last_poll":    _status["last_poll"],
+            "status":        "running",
+            "last_poll":     _status["last_poll"],
             "uploads_today": _status["uploads_today"],
         })
         self.wfile.write(resp.encode())
@@ -241,30 +291,36 @@ def process_queue():
                 if metadata.get("status") != "ready":
                     continue
 
-                # Cek jadwal publish
+                # Cek jadwal publish — skip tanpa notif (tidak spam)
                 publish_at = metadata.get("publish_at", "")
                 if publish_at:
                     try:
                         pub_dt = datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
                         if pub_dt > now_utc:
                             logger.info(f"[{ch_id}] {folder_name} belum waktunya, skip.")
-                            continue
+                            continue  # ← TIDAK kirim notif, cukup log
                     except Exception:
                         pass
 
-                # Download video
+                # Download video — mulai proses nyata, kirim notif
                 video_id_gdrive = _find_file_in_folder(drive, folder_id, "video.mp4")
                 if not video_id_gdrive:
                     continue
 
                 logger.info(f"[{ch_id}] Downloading: {folder_name}...")
+                _send_telegram(
+                    f"📥 <b>Mulai proses upload</b>\n"
+                    f"Channel : <code>{ch_id}</code>\n"
+                    f"Video   : <code>{folder_name}</code>"
+                )
+
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                     video_path = tmp.name
                 _download_file(drive, video_id_gdrive, video_path)
 
                 # Download thumbnail
-                thumb_path    = None
-                thumb_id      = _find_file_in_folder(drive, folder_id, "thumbnail.png")
+                thumb_path = None
+                thumb_id   = _find_file_in_folder(drive, folder_id, "thumbnail.png")
                 if thumb_id:
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                         thumb_path = tmp.name
@@ -277,8 +333,27 @@ def process_queue():
                     logger.info(f"[{ch_id}] ✅ {url}")
                     _status["uploads_today"] += 1
                     _move_to_done(drive, folder_id, done_id, ch_id)
+
+                    # ✅ Notif sukses
+                    _send_telegram(
+                        f"✅ <b>Upload berhasil!</b>\n"
+                        f"Channel : <code>{ch_id}</code>\n"
+                        f"Judul   : {metadata['title']}\n"
+                        f"URL     : {url}\n"
+                        f"Total hari ini: <b>{_status['uploads_today']} video</b>"
+                    )
+
                 except Exception as e:
                     logger.error(f"[{ch_id}] Upload gagal: {e}")
+
+                    # ❌ Notif gagal
+                    _send_telegram(
+                        f"❌ <b>Upload GAGAL!</b>\n"
+                        f"Channel : <code>{ch_id}</code>\n"
+                        f"Video   : <code>{folder_name}</code>\n"
+                        f"Error   : <code>{str(e)[:300]}</code>"
+                    )
+
                 finally:
                     if os.path.exists(video_path): os.remove(video_path)
                     if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
@@ -288,10 +363,24 @@ def process_queue():
         except Exception as e:
             logger.error(f"[{ch_id}] Error: {e}")
 
+            # ⚠️ Notif error channel (token expired, dll)
+            _send_telegram(
+                f"⚠️ <b>Error channel!</b>\n"
+                f"Channel : <code>{ch_id}</code>\n"
+                f"Error   : <code>{str(e)[:300]}</code>"
+            )
+
 
 def main():
     logger.info("🚀 YouTube Uploader dimulai")
     logger.info(f"   Polling setiap {POLL_INTERVAL_SEC} detik")
+
+    # Notif start — hanya sekali saat pertama jalan
+    _send_telegram(
+        f"🚀 <b>YouTube Uploader started!</b>\n"
+        f"Polling setiap {POLL_INTERVAL_SEC // 60} menit\n"
+        f"Channels aktif: <b>{len(CHANNELS)}</b>"
+    )
 
     # Start HTTP server di thread terpisah (untuk Uptime.com ping)
     t = threading.Thread(target=_start_health_server, daemon=True)
