@@ -1,7 +1,7 @@
 """
 koyeb_app/main.py - YouTube Upload Scheduler
-Jalan 24 jam di Koyeb, polling GDrive setiap 30 menit
-Ambil video dari /queue/ → upload ke YouTube → pindah ke /done/
+Polling GDrive setiap 1 menit, upload ke YouTube kalau sudah waktunya.
+HTTP server di port 8080 untuk keep-alive ping dari Uptime.com
 """
 
 import os
@@ -11,21 +11,22 @@ import pickle
 import base64
 import tempfile
 import logging
+import threading
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("koyeb")
+logger = logging.getLogger("uploader")
 
 POLL_INTERVAL_SEC = 1 * 60  # 1 menit
 GDRIVE_ROOT       = "mesin_cuan"
 QUEUE_FOLDER      = "queue"
 DONE_FOLDER       = "done"
 
-# Channel config — sama dengan settings.json di laptop
 CHANNELS = [
     {"id": "ch_id_horror", "env_key": "TOKEN_CH_ID_HORROR", "language": "id"},
     {"id": "ch_id_psych",  "env_key": "TOKEN_CH_ID_PSYCH",  "language": "id"},
@@ -33,23 +34,46 @@ CHANNELS = [
     {"id": "ch_en_psych",  "env_key": "TOKEN_CH_EN_PSYCH",  "language": "en"},
 ]
 
+# Status untuk health check
+_status = {"last_poll": None, "uploads_today": 0, "running": True}
+
+
+# ─── HTTP Keep-alive server ───────────────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        resp = json.dumps({
+            "status":       "running",
+            "last_poll":    _status["last_poll"],
+            "uploads_today": _status["uploads_today"],
+        })
+        self.wfile.write(resp.encode())
+
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP logs
+
+
+def _start_health_server():
+    port   = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health server jalan di port {port}")
+    server.serve_forever()
+
 
 # ─── Token helpers ────────────────────────────────────────────────────────────
 
 def _load_creds_from_env(env_key: str):
-    """Load OAuth credentials dari Koyeb environment variable (base64 encoded)."""
     b64 = os.environ.get(env_key)
     if not b64:
-        raise EnvironmentError(f"Environment variable '{env_key}' tidak ditemukan di Koyeb.")
-
-    raw = base64.b64decode(b64.encode("utf-8"))
+        raise EnvironmentError(f"Env variable '{env_key}' tidak ditemukan.")
+    raw   = base64.b64decode(b64.encode("utf-8"))
     creds = pickle.loads(raw)
-
-    # Refresh kalau expired
     if creds.expired and creds.refresh_token:
         from google.auth.transport.requests import Request
         creds.refresh(Request())
-
     return creds
 
 
@@ -65,7 +89,7 @@ def _get_youtube_service(creds):
 
 # ─── GDrive helpers ───────────────────────────────────────────────────────────
 
-def _find_folder(service, name: str, parent_id: str | None) -> str | None:
+def _find_folder(service, name: str, parent_id) -> str | None:
     query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
@@ -74,20 +98,19 @@ def _find_folder(service, name: str, parent_id: str | None) -> str | None:
     return files[0]["id"] if files else None
 
 
-def _ensure_folder(service, name: str, parent_id: str | None) -> str:
+def _ensure_folder(service, name: str, parent_id) -> str:
     folder_id = _find_folder(service, name, parent_id)
     if folder_id:
         return folder_id
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     if parent_id:
         meta["parents"] = [parent_id]
-    folder = service.files().create(body=meta, fields="id").execute()
-    return folder["id"]
+    return service.files().create(body=meta, fields="id").execute()["id"]
 
 
 def _list_subfolders(service, parent_id: str) -> list:
     query   = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    results = service.files().list(q=query, fields="files(id, name)", orderBy="name").execute()
     return results.get("files", [])
 
 
@@ -100,8 +123,6 @@ def _find_file_in_folder(service, folder_id: str, filename: str) -> str | None:
 
 def _download_file(service, file_id: str, dest_path: str):
     from googleapiclient.http import MediaIoBaseDownload
-    import io
-
     request = service.files().get_media(fileId=file_id)
     with open(dest_path, "wb") as f:
         downloader = MediaIoBaseDownload(f, request)
@@ -110,39 +131,24 @@ def _download_file(service, file_id: str, dest_path: str):
             _, done = downloader.next_chunk()
 
 
-def _move_to_done(service, folder_id: str, done_root_id: str, ch_id: str, folder_name: str):
-    """Pindahkan folder dari queue ke done."""
-    ch_done = _ensure_folder(service, ch_id, done_root_id)
-
-    # Update parent folder
+def _move_to_done(service, folder_id: str, done_root_id: str, ch_id: str):
+    ch_done    = _ensure_folder(service, ch_id, done_root_id)
+    file_info  = service.files().get(fileId=folder_id, fields="parents").execute()
+    old_parent = file_info.get("parents", [""])[0]
     service.files().update(
         fileId=folder_id,
         addParents=ch_done,
-        removeParents=_get_parent_id(service, folder_id),
+        removeParents=old_parent,
         fields="id, parents"
     ).execute()
-    logger.info(f"[{ch_id}] Moved to /done/{ch_id}/{folder_name}")
-
-
-def _get_parent_id(service, file_id: str) -> str:
-    result = service.files().get(fileId=file_id, fields="parents").execute()
-    parents = result.get("parents", [])
-    return parents[0] if parents else ""
-
-
-def _delete_folder(service, folder_id: str):
-    service.files().delete(fileId=folder_id).execute()
 
 
 # ─── YouTube upload ───────────────────────────────────────────────────────────
 
 def _upload_to_youtube(yt_service, video_path: str, thumbnail_path: str, metadata: dict) -> str:
     from googleapiclient.http import MediaFileUpload
-    from datetime import datetime, timezone
 
-    language   = metadata.get("language", "id")
-    publish_at = metadata.get("publish_at", "")
-
+    language = metadata.get("language", "id")
     body = {
         "snippet": {
             "title":                metadata["title"],
@@ -153,7 +159,7 @@ def _upload_to_youtube(yt_service, video_path: str, thumbnail_path: str, metadat
             "defaultAudioLanguage": language,
         },
         "status": {
-            "privacyStatus":           "public",  # Koyeb upload langsung public
+            "privacyStatus":           "public",
             "selfDeclaredMadeForKids": metadata.get("made_for_kids", False),
             "embeddable":              True,
             "publicStatsViewable":     True,
@@ -174,52 +180,44 @@ def _upload_to_youtube(yt_service, video_path: str, thumbnail_path: str, metadat
         if status:
             logger.info(f"Upload progress: {int(status.progress()*100)}%")
 
-    video_id  = response["id"]
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    video_id = response["id"]
+    url      = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Set thumbnail
     if thumbnail_path and os.path.exists(thumbnail_path):
         try:
             media_thumb = MediaFileUpload(thumbnail_path, mimetype="image/png")
             yt_service.thumbnails().set(videoId=video_id, media_body=media_thumb).execute()
-            logger.info(f"Thumbnail set untuk {video_id}")
         except Exception as e:
-            logger.warning(f"Set thumbnail gagal (non-fatal): {e}")
+            logger.warning(f"Thumbnail gagal: {e}")
 
-    return video_url
+    return url
 
 
-# ─── Main polling loop ────────────────────────────────────────────────────────
+# ─── Main polling ─────────────────────────────────────────────────────────────
 
 def process_queue():
-    """Proses semua video di queue yang sudah waktunya diupload."""
     now_utc = datetime.now(timezone.utc)
-    logger.info(f"Polling queue — {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    logger.info(f"Polling — {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    _status["last_poll"] = now_utc.isoformat()
 
     for ch in CHANNELS:
         ch_id   = ch["id"]
         env_key = ch["env_key"]
 
         try:
-            creds    = _load_creds_from_env(env_key)
-            drive    = _get_drive_service(creds)
-            youtube  = _get_youtube_service(creds)
+            creds   = _load_creds_from_env(env_key)
+            drive   = _get_drive_service(creds)
+            youtube = _get_youtube_service(creds)
 
-            # Navigasi ke queue folder channel ini
             root_id  = _find_folder(drive, GDRIVE_ROOT, None)
-            if not root_id:
-                continue
+            if not root_id: continue
             queue_id = _find_folder(drive, QUEUE_FOLDER, root_id)
-            if not queue_id:
-                continue
+            if not queue_id: continue
             ch_queue = _find_folder(drive, ch_id, queue_id)
-            if not ch_queue:
-                continue
+            if not ch_queue: continue
 
-            # List semua subfolder (1 subfolder = 1 video)
             subfolders = _list_subfolders(drive, ch_queue)
             if not subfolders:
-                logger.info(f"[{ch_id}] Queue kosong.")
                 continue
 
             done_id = _ensure_folder(drive, DONE_FOLDER, root_id)
@@ -228,21 +226,18 @@ def process_queue():
                 folder_id   = folder["id"]
                 folder_name = folder["name"]
 
-                # Download metadata.json
-                meta_file_id = _find_file_in_folder(drive, folder_id, "metadata.json")
-                if not meta_file_id:
-                    logger.warning(f"[{ch_id}] metadata.json tidak ditemukan di {folder_name}")
+                # Download metadata
+                meta_id = _find_file_in_folder(drive, folder_id, "metadata.json")
+                if not meta_id:
                     continue
 
                 with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
                     meta_path = tmp.name
-                _download_file(drive, meta_file_id, meta_path)
-
+                _download_file(drive, meta_id, meta_path)
                 with open(meta_path, "r", encoding="utf-8") as f:
                     metadata = json.load(f)
                 os.remove(meta_path)
 
-                # Cek status
                 if metadata.get("status") != "ready":
                     continue
 
@@ -252,67 +247,61 @@ def process_queue():
                     try:
                         pub_dt = datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
                         if pub_dt > now_utc:
-                            logger.info(f"[{ch_id}] {folder_name} belum waktunya ({publish_at}), skip.")
+                            logger.info(f"[{ch_id}] {folder_name} belum waktunya, skip.")
                             continue
                     except Exception:
-                        pass  # Kalau parse gagal, tetap upload
+                        pass
 
                 # Download video
-                video_file_id = _find_file_in_folder(drive, folder_id, "video.mp4")
-                if not video_file_id:
-                    logger.warning(f"[{ch_id}] video.mp4 tidak ditemukan di {folder_name}")
+                video_id_gdrive = _find_file_in_folder(drive, folder_id, "video.mp4")
+                if not video_id_gdrive:
                     continue
 
-                logger.info(f"[{ch_id}] Downloading video: {folder_name}...")
+                logger.info(f"[{ch_id}] Downloading: {folder_name}...")
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                     video_path = tmp.name
-                _download_file(drive, video_file_id, video_path)
+                _download_file(drive, video_id_gdrive, video_path)
 
-                # Download thumbnail (optional)
+                # Download thumbnail
                 thumb_path    = None
-                thumb_file_id = _find_file_in_folder(drive, folder_id, "thumbnail.png")
-                if thumb_file_id:
+                thumb_id      = _find_file_in_folder(drive, folder_id, "thumbnail.png")
+                if thumb_id:
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                         thumb_path = tmp.name
-                    _download_file(drive, thumb_file_id, thumb_path)
+                    _download_file(drive, thumb_id, thumb_path)
 
                 # Upload ke YouTube
-                logger.info(f"[{ch_id}] Uploading ke YouTube: {metadata['title']}")
+                logger.info(f"[{ch_id}] Uploading: {metadata['title']}")
                 try:
                     url = _upload_to_youtube(youtube, video_path, thumb_path, metadata)
-                    logger.info(f"[{ch_id}] ✅ Upload sukses: {url}")
-
-                    # Pindah ke /done/
-                    _move_to_done(drive, folder_id, done_id, ch_id, folder_name)
-
+                    logger.info(f"[{ch_id}] ✅ {url}")
+                    _status["uploads_today"] += 1
+                    _move_to_done(drive, folder_id, done_id, ch_id)
                 except Exception as e:
                     logger.error(f"[{ch_id}] Upload gagal: {e}")
-
                 finally:
-                    # Cleanup temp files
-                    if os.path.exists(video_path):
-                        os.remove(video_path)
-                    if thumb_path and os.path.exists(thumb_path):
-                        os.remove(thumb_path)
+                    if os.path.exists(video_path): os.remove(video_path)
+                    if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
-                # Jeda 60 detik antar upload agar tidak burst
-                time.sleep(60)
+                time.sleep(60)  # Jeda 60 detik antar upload
 
         except Exception as e:
             logger.error(f"[{ch_id}] Error: {e}")
 
 
 def main():
-    logger.info("🚀 Koyeb YouTube Scheduler dimulai")
-    logger.info(f"   Polling setiap {POLL_INTERVAL_SEC//60} menit")
+    logger.info("🚀 YouTube Uploader dimulai")
+    logger.info(f"   Polling setiap {POLL_INTERVAL_SEC} detik")
+
+    # Start HTTP server di thread terpisah (untuk Uptime.com ping)
+    t = threading.Thread(target=_start_health_server, daemon=True)
+    t.start()
 
     while True:
         try:
             process_queue()
         except Exception as e:
             logger.error(f"Polling error: {e}")
-
-        logger.info(f"Tidur {POLL_INTERVAL_SEC//60} menit...")
         time.sleep(POLL_INTERVAL_SEC)
 
 
