@@ -1,6 +1,6 @@
 """
 koyeb_app/main.py - YouTube Upload Scheduler
-Polling GDrive setiap 1 menit, upload ke YouTube kalau sudah waktunya.
+Polling GDrive setiap 5 menit, upload ke YouTube kalau sudah waktunya.
 HTTP server di port 8080 untuk keep-alive ping dari Uptime.com
 
 Notifikasi Telegram — hanya event penting (tidak spam):
@@ -9,6 +9,7 @@ Notifikasi Telegram — hanya event penting (tidak spam):
   ✅ Upload berhasil
   ❌ Upload gagal
   ⚠️  Error channel (token expired, dll)
+  📊 Daily summary (tiap tengah malam UTC)
 
 Setup (set env vars di Koyeb):
   TELEGRAM_BOT_TOKEN  → token dari @BotFather
@@ -35,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("uploader")
 
-POLL_INTERVAL_SEC = 1 * 60  # 1 menit
+POLL_INTERVAL_SEC = 5 * 60  # 5 menit
 GDRIVE_ROOT       = "mesin_cuan"
 QUEUE_FOLDER      = "queue"
 DONE_FOLDER       = "done"
@@ -47,11 +48,18 @@ CHANNELS = [
     {"id": "ch_en_psych",  "env_key": "TOKEN_CH_EN_PSYCH",  "language": "en"},
 ]
 
-_status = {"last_poll": None, "uploads_today": 0, "running": True}
+_status = {
+    "last_poll":      None,
+    "uploads_today":  0,
+    "errors_today":   0,
+    "skipped_today":  0,
+    "running":        True,
+    "last_summary":   None,   # tanggal terakhir summary dikirim (YYYY-MM-DD)
+    "per_channel":    {ch["id"]: 0 for ch in CHANNELS},  # upload per channel hari ini
+}
 
 
 # ─── Telegram Notifikasi ──────────────────────────────────────────────────────
-# Hanya dipanggil untuk event PENTING. Polling & skip tidak di-notif.
 
 def _send_telegram(message: str):
     """
@@ -84,8 +92,50 @@ def _send_telegram(message: str):
             if resp.status != 200:
                 logger.warning(f"Telegram response: {resp.status}")
     except Exception as e:
-        # Gagal kirim notif tidak boleh crash uploader
         logger.warning(f"Gagal kirim Telegram notif: {e}")
+
+
+# ─── Daily Summary ────────────────────────────────────────────────────────────
+
+def _check_and_send_daily_summary(now_utc: datetime):
+    """
+    Kirim daily summary tiap tengah malam UTC.
+    Hanya dikirim sekali per hari, dicek setiap polling.
+    Setelah kirim, reset semua counter harian.
+    """
+    today_str = now_utc.strftime("%Y-%m-%d")
+
+    # Kirim summary di jam 00:00–00:05 UTC, dan belum pernah kirim hari ini
+    is_midnight_window = now_utc.hour == 0 and now_utc.minute < 5
+    already_sent_today = _status["last_summary"] == today_str
+
+    if not is_midnight_window or already_sent_today:
+        return
+
+    # Susun ringkasan per channel
+    per_ch_lines = ""
+    for ch_id, count in _status["per_channel"].items():
+        per_ch_lines += f"  • {ch_id}: <b>{count} video</b>\n"
+
+    summary_msg = (
+        f"📊 <b>Daily Summary — {today_str}</b>\n\n"
+        f"✅ Upload berhasil : <b>{_status['uploads_today']} video</b>\n"
+        f"❌ Error           : <b>{_status['errors_today']}x</b>\n"
+        f"⏭️ Skip (jadwal)   : <b>{_status['skipped_today']}x</b>\n\n"
+        f"<b>Per Channel:</b>\n{per_ch_lines}\n"
+        f"Polling interval: {POLL_INTERVAL_SEC // 60} menit"
+    )
+
+    _send_telegram(summary_msg)
+    logger.info("Daily summary terkirim ke Telegram")
+
+    # Reset semua counter harian
+    _status["uploads_today"] = 0
+    _status["errors_today"]  = 0
+    _status["skipped_today"] = 0
+    _status["last_summary"]  = today_str
+    for ch_id in _status["per_channel"]:
+        _status["per_channel"][ch_id] = 0
 
 
 # ─── HTTP Keep-alive server ───────────────────────────────────────────────────
@@ -99,6 +149,9 @@ class HealthHandler(BaseHTTPRequestHandler):
             "status":        "running",
             "last_poll":     _status["last_poll"],
             "uploads_today": _status["uploads_today"],
+            "errors_today":  _status["errors_today"],
+            "skipped_today": _status["skipped_today"],
+            "per_channel":   _status["per_channel"],
         })
         self.wfile.write(resp.encode())
 
@@ -250,6 +303,9 @@ def process_queue():
     logger.info(f"Polling — {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     _status["last_poll"] = now_utc.isoformat()
 
+    # Cek & kirim daily summary kalau sudah tengah malam
+    _check_and_send_daily_summary(now_utc)
+
     for ch in CHANNELS:
         ch_id   = ch["id"]
         env_key = ch["env_key"]
@@ -298,6 +354,7 @@ def process_queue():
                         pub_dt = datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
                         if pub_dt > now_utc:
                             logger.info(f"[{ch_id}] {folder_name} belum waktunya, skip.")
+                            _status["skipped_today"] += 1
                             continue  # ← TIDAK kirim notif, cukup log
                     except Exception:
                         pass
@@ -331,7 +388,8 @@ def process_queue():
                 try:
                     url = _upload_to_youtube(youtube, video_path, thumb_path, metadata)
                     logger.info(f"[{ch_id}] ✅ {url}")
-                    _status["uploads_today"] += 1
+                    _status["uploads_today"]          += 1
+                    _status["per_channel"][ch_id]     += 1
                     _move_to_done(drive, folder_id, done_id, ch_id)
 
                     # ✅ Notif sukses
@@ -345,6 +403,7 @@ def process_queue():
 
                 except Exception as e:
                     logger.error(f"[{ch_id}] Upload gagal: {e}")
+                    _status["errors_today"] += 1
 
                     # ❌ Notif gagal
                     _send_telegram(
@@ -362,6 +421,7 @@ def process_queue():
 
         except Exception as e:
             logger.error(f"[{ch_id}] Error: {e}")
+            _status["errors_today"] += 1
 
             # ⚠️ Notif error channel (token expired, dll)
             _send_telegram(
@@ -373,13 +433,14 @@ def process_queue():
 
 def main():
     logger.info("🚀 YouTube Uploader dimulai")
-    logger.info(f"   Polling setiap {POLL_INTERVAL_SEC} detik")
+    logger.info(f"   Polling setiap {POLL_INTERVAL_SEC // 60} menit")
 
     # Notif start — hanya sekali saat pertama jalan
     _send_telegram(
         f"🚀 <b>YouTube Uploader started!</b>\n"
         f"Polling setiap {POLL_INTERVAL_SEC // 60} menit\n"
-        f"Channels aktif: <b>{len(CHANNELS)}</b>"
+        f"Channels aktif: <b>{len(CHANNELS)}</b>\n"
+        f"Daily summary: tiap 00:00 UTC (07:00 WIB)"
     )
 
     # Start HTTP server di thread terpisah (untuk Uptime.com ping)
