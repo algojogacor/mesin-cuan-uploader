@@ -1,0 +1,23 @@
+# Secrets & credentials
+.env
+*.pickle
+token_*.json
+client_secret*.json
+credentials.json
+service_account*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
